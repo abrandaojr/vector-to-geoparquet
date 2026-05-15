@@ -188,12 +188,55 @@ def convert_to_geoparquet(
     import numpy as np
     import pyarrow.parquet as pq
     import geopandas as gpd
-    from shapely import make_valid, hilbert_distance
+    from shapely import make_valid
     from shapely.geometry import (
         Point, MultiPoint,
         LineString, MultiLineString,
         Polygon, MultiPolygon,
     )
+
+    # hilbert_distance was added in Shapely 2.0. Provide a pure-Python/NumPy
+    # fallback so the function works with older installations as well.
+    try:
+        from shapely import hilbert_distance as _shapely_hilbert
+        def _hilbert_sort_key(geom_series, bounds, p: int) -> "np.ndarray":
+            return _shapely_hilbert(geom_series, bounds, p=p)
+    except ImportError:
+        def _xy_to_d(n: int, x: int, y: int) -> int:
+            """Convert (x, y) grid cell to Hilbert curve distance."""
+            d = 0
+            s = n >> 1
+            while s:
+                rx = 1 if x & s else 0
+                ry = 1 if y & s else 0
+                d += s * s * ((3 * rx) ^ ry)
+                if ry == 0:
+                    if rx == 1:
+                        x = s - 1 - x
+                        y = s - 1 - y
+                    x, y = y, x
+                s >>= 1
+            return d
+
+        def _hilbert_sort_key(geom_series, bounds, p: int) -> "np.ndarray":
+            """
+            Fallback Hilbert distance for Shapely < 2.0.
+            Uses the bounding-box center of each geometry (same as the
+            Shapely 2.0 implementation for non-point geometries).
+            """
+            n = 2 ** p
+            minx, miny, maxx, maxy = bounds
+            dx = maxx - minx or 1.0
+            dy = maxy - miny or 1.0
+            geom_bounds = np.array([g.bounds for g in geom_series])
+            cx = (geom_bounds[:, 0] + geom_bounds[:, 2]) / 2.0
+            cy = (geom_bounds[:, 1] + geom_bounds[:, 3]) / 2.0
+            xi = np.clip(((cx - minx) / dx * (n - 1)).astype(np.int64), 0, n - 1)
+            yi = np.clip(((cy - miny) / dy * (n - 1)).astype(np.int64), 0, n - 1)
+            return np.array(
+                [_xy_to_d(n, int(x), int(y)) for x, y in zip(xi, yi)],
+                dtype=np.int64,
+            )
 
     # ------------------------------------------------------------------
     # 1. Reference constants (IBGE Resolution R.PR-1/2005)
@@ -388,11 +431,11 @@ def convert_to_geoparquet(
     # spatial area, so most row groups are skipped before any WKB geometry
     # is deserialized.
     #
-    # Note: shapely.hilbert_distance uses the bounding box of each
-    # geometry (not its centroid), so polygon rings, line vertices, and
-    # point coordinates all contribute correctly to the sort key.
+    # Note: _hilbert_sort_key uses the bounding box of each geometry
+    # (not its centroid), so polygon rings, line vertices, and point
+    # coordinates all contribute correctly to the sort key.
     total_bounds = geom_proj.total_bounds   # (minx, miny, maxx, maxy) in m
-    hilbert_idx = hilbert_distance(
+    hilbert_idx = _hilbert_sort_key(
         geom_proj,
         total_bounds,
         p=hilbert_p,
