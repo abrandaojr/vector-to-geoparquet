@@ -4,8 +4,8 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "vector-to-geoparquet"
-version = "1.0.0"
-description = "Brazil-specific converter from any vector format to DuckDB-optimized GeoParquet using SIRGAS2000 (IBGE R.PR-1/2005)"
+version = "1.1.0"
+description = "Brazil-specific converter from any vector format to DuckDB-optimized GeoParquet (EPSG:5880, IBGE R.PR-1/2005)"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ authors = [
     { name = "Amintas Brandao Jr.", email = "abrandaojr@gmail.com" }
 ]
 keywords = [
-    "geoparquet", "geopandas", "duckdb", "sirgas2000", "brazil", "brasil",
+    "geoparquet", "geopandas", "duckdb", "sirgas2000", "epsg5880", "brazil", "brasil",
     "geospatial", "hilbert", "spatial", "ibge", "sicar", "car", "prodes",
     "mapbiomas", "cerrado", "amazon", "deforestation", "forest-code"
 ]
@@ -40,13 +40,14 @@ vector-to-geoparquet = "vector_to_geoparquet:_cli"
 
 [project.urls]
 Repository = "https://github.com/abrandaojr/vector-to-geoparquet"
+Changelog  = "https://github.com/abrandaojr/vector-to-geoparquet/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where   = ["."]
 include = ["vector_to_geoparquet*"]
 
 [tool.ruff]
-line-length = 99
+line-length    = 99
 target-version = "py310"
 
 [tool.ruff.lint]
