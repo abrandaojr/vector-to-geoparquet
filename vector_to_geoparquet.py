@@ -1,17 +1,22 @@
-"""
-vector_to_geoparquet.py -- Brazil-specific vector → DuckDB-optimized GeoParquet.
+"""vector_to_geoparquet.py
+=========================
+**Brazil-specific** utility to convert any vector file with coverage over
+Brazilian territory to a DuckDB-optimized GeoParquet file.
 
-Output CRS : SIRGAS2000 geographic  EPSG:4674  (IBGE Resolution R.PR-1/2005)
-Metric CRS : SIRGAS2000 / Brazil Polyconic  EPSG:5880  (tiles + Hilbert)
+Geographic scope
+----------------
+Output CRS : SIRGAS 2000 / Brazil Polyconic -- EPSG:5880  (metres, IBGE-mandated
+             for area calculation per Resolution R.PR-1/2005)
+Input norm : SIRGAS 2000 geographic -- EPSG:4674  (intermediate step only)
 
     pip install geopandas pyogrio pyarrow shapely numpy
     python vector_to_geoparquet.py <input> <output.parquet> [layer]
 """
+
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Core function
-# ---------------------------------------------------------------------------
+__version__ = "1.1.0"
+
 
 def convert_to_geoparquet(
     input_path: str,
@@ -23,50 +28,97 @@ def convert_to_geoparquet(
     compression_level: int        = 3,
     hilbert_p:         int        = 15,
 ) -> dict:
-    """Convert a Brazil-extent vector file to a DuckDB-optimized GeoParquet."""
+    """Convert a Brazil-extent vector file to a DuckDB-optimized GeoParquet.
 
-    # -- imports ------------------------------------------------------------
-    import os, warnings
+    Parameters
+    ----------
+    input_path : str
+        Path to the input vector file (any pyogrio-supported format).
+    output_path : str
+        Path to the output ``.parquet`` file.
+    layer : str, optional
+        Layer name for multi-layer formats (GeoPackage, etc.).
+    tile_size_m : float
+        Tile edge length in metres.  Default 25 000 m (25 km).
+    row_group_size : int
+        Rows per Parquet row group.  Default 65 536.
+    compression : str
+        Parquet compression codec.  Default ``"zstd"``.
+    compression_level : int
+        ZSTD compression level (1–22).  Default 3.
+    hilbert_p : int
+        Hilbert curve resolution.  Default 15 (~150 m cells over Brazil).
+
+    Returns
+    -------
+    dict
+        Conversion report with paths, CRS, feature counts, tile count,
+        bounding box, and output file size.
+    """
+
+    # ------------------------------------------------------------------
+    # Imports
+    # ------------------------------------------------------------------
+    import json
+    import os
+    import warnings
+
     import numpy as np
     import geopandas as gpd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
     from shapely import make_valid
     from shapely.geometry import (
-        Point, MultiPoint, LineString, MultiLineString, Polygon, MultiPolygon,
+        LineString, MultiLineString,
+        Point, MultiPoint,
+        Polygon, MultiPolygon,
     )
 
-    # Hilbert distance: Shapely 2.0 vectorized; pure-NumPy fallback otherwise.
+    # Hilbert distance: Shapely ≥ 2.0 vectorised API; NumPy fallback otherwise.
     try:
         from shapely import hilbert_distance
-        def _hilbert(gs, bounds, p): return hilbert_distance(gs, bounds, p=p)
+
+        def _hilbert(gs, bounds, p):
+            return hilbert_distance(gs, bounds, p=p)
+
     except ImportError:
-        def _d(n, x, y):
+
+        def _d(n: int, x: int, y: int) -> int:
             d, s = 0, n >> 1
             while s:
                 rx, ry = int(bool(x & s)), int(bool(y & s))
                 d += s * s * ((3 * rx) ^ ry)
                 if not ry:
-                    if rx: x, y = s-1-x, s-1-y
+                    if rx:
+                        x, y = s - 1 - x, s - 1 - y
                     x, y = y, x
                 s >>= 1
             return d
-        def _hilbert(gs, bounds, p):
-            n = 2**p
-            x0, y0, x1, y1 = bounds
-            dx, dy = x1-x0 or 1., y1-y0 or 1.
-            b = np.array([g.bounds for g in gs])
-            cx = (b[:,0]+b[:,2])/2; cy = (b[:,1]+b[:,3])/2
-            xi = np.clip(((cx-x0)/dx*(n-1)).astype(np.int64), 0, n-1)
-            yi = np.clip(((cy-y0)/dy*(n-1)).astype(np.int64), 0, n-1)
-            return np.array([_d(n,int(x),int(y)) for x,y in zip(xi,yi)], dtype=np.int64)
 
-    # -- constants ----------------------------------------------------------
-    CRS_GEO    = "EPSG:4674"
-    CRS_METRIC = "EPSG:5880"
+        def _hilbert(gs, bounds, p):  # type: ignore[misc]
+            n = 2 ** p
+            x0, y0, x1, y1 = bounds
+            dx, dy = x1 - x0 or 1.0, y1 - y0 or 1.0
+            b  = np.array([g.bounds for g in gs])
+            cx = (b[:, 0] + b[:, 2]) / 2.0
+            cy = (b[:, 1] + b[:, 3]) / 2.0
+            xi = np.clip(((cx - x0) / dx * (n - 1)).astype(np.int64), 0, n - 1)
+            yi = np.clip(((cy - y0) / dy * (n - 1)).astype(np.int64), 0, n - 1)
+            return np.array(
+                [_d(n, int(x), int(y)) for x, y in zip(xi, yi)], dtype=np.int64
+            )
+
+    # ------------------------------------------------------------------
+    # Constants
+    # ------------------------------------------------------------------
+    CRS_GEO    = "EPSG:4674"   # SIRGAS 2000 geographic (input normalisation only)
+    CRS_METRIC = "EPSG:5880"   # SIRGAS 2000 / Brazil Polyconic — OUTPUT CRS
+                               # IBGE R.PR-1/2005: mandatory for area calculation
 
     FAMILY = {
-        "Point":"point","MultiPoint":"point",
-        "LineString":"line","MultiLineString":"line",
-        "Polygon":"polygon","MultiPolygon":"polygon",
+        "Point": "point",          "MultiPoint": "point",
+        "LineString": "line",      "MultiLineString": "line",
+        "Polygon": "polygon",      "MultiPolygon": "polygon",
     }
     GEOM_TYPES = {
         "point":   ("Point",      "MultiPoint",      Point,      MultiPoint),
@@ -74,48 +126,72 @@ def convert_to_geoparquet(
         "polygon": ("Polygon",    "MultiPolygon",     Polygon,    MultiPolygon),
     }
 
-    # -- read ---------------------------------------------------------------
-    kw = {"engine": "pyogrio"}
-    if layer is not None: kw["layer"] = layer
-    gdf = gpd.read_file(input_path, **kw)
-    if gdf.empty: raise ValueError("Input file contains no features.")
-    n_in    = len(gdf)
-    in_crs  = str(gdf.crs) if gdf.crs else "undefined"
+    # ------------------------------------------------------------------
+    # 1. Read
+    # ------------------------------------------------------------------
+    kw: dict = {"engine": "pyogrio"}
+    if layer is not None:
+        kw["layer"] = layer
 
-    # -- dominant geometry family -------------------------------------------
-    counts = (gdf.geom_type.dropna()
-                .map(lambda t: FAMILY.get(t, "other"))
-                .value_counts())
+    gdf    = gpd.read_file(input_path, **kw)
+    n_in   = len(gdf)
+    in_crs = str(gdf.crs) if gdf.crs is not None else "undefined"
+
+    if gdf.empty:
+        raise ValueError("Input file contains no features.")
+
+    # ------------------------------------------------------------------
+    # 2. Dominant geometry family
+    # ------------------------------------------------------------------
+    counts = (
+        gdf.geom_type.dropna()
+        .map(lambda t: FAMILY.get(t, "other"))
+        .value_counts()
+    )
     counts = counts[counts.index != "other"]
-    if counts.empty: raise ValueError("Cannot determine geometry type.")
-    family = counts.index[0]
+    if counts.empty:
+        raise ValueError("Cannot determine geometry type.")
+    family: str = counts.index[0]
 
-    # -- reproject to EPSG:4674 ---------------------------------------------
+    # ------------------------------------------------------------------
+    # 3. Normalise to EPSG:4674 → repair → reproject to EPSG:5880
+    #
+    # Geometry repair (make_valid) is applied in geographic space
+    # (EPSG:4674) before the final reproject to the output CRS
+    # (EPSG:5880 — SIRGAS 2000 / Brazil Polyconic, unit: metres).
+    # EPSG:4674 is used only as an intermediate normalisation step.
+    # ------------------------------------------------------------------
     if gdf.crs is None:
-        warnings.warn("No CRS -- assuming EPSG:4674.", UserWarning, stacklevel=2)
+        warnings.warn("No CRS defined — assuming EPSG:4674.", UserWarning, stacklevel=2)
         gdf = gdf.set_crs(CRS_GEO)
     elif not gdf.crs.equals(CRS_GEO):
         gdf = gdf.to_crs(CRS_GEO)
 
-    # -- repair geometries (vectorized Shapely 2.0) -------------------------
+    # ------------------------------------------------------------------
+    # 4. Repair geometries (Shapely 2.0 vectorised)
+    # ------------------------------------------------------------------
     gdf = gdf.copy()
     gdf["geometry"] = make_valid(gdf["geometry"].values)
     gdf = gdf[gdf["geometry"].notna() & ~gdf["geometry"].is_empty].copy()
 
-    # -- enforce geometry-type homogeneity ----------------------------------
+    # ------------------------------------------------------------------
+    # 5. Enforce geometry-type homogeneity
+    # ------------------------------------------------------------------
     sname, mname, _, mcls = GEOM_TYPES[family]
 
     def _extract(geom):
-        if geom is None or geom.is_empty: return None
+        if geom is None or geom.is_empty:
+            return None
         gt = geom.geom_type
-        if gt in (sname, mname): return geom
+        if gt in (sname, mname):
+            return geom
         if gt == "GeometryCollection":
-            parts = [_extract(g) for g in geom.geoms]
-            parts = [p for p in parts if p is not None and not p.is_empty]
+            parts   = [_extract(g) for g in geom.geoms]
             singles = []
-            for p in parts:
-                (singles.extend(p.geoms) if p.geom_type == mname else singles.append(p))
-            if not singles: return None
+            for p in (p for p in parts if p is not None and not p.is_empty):
+                singles.extend(p.geoms) if p.geom_type == mname else singles.append(p)
+            if not singles:
+                return None
             return singles[0] if len(singles) == 1 else mcls(singles)
         return None
 
@@ -123,8 +199,14 @@ def convert_to_geoparquet(
     gdf = gdf[gdf["geometry"].notna() & ~gdf["geometry"].is_empty].copy()
     n_out = len(gdf)
 
-    # -- 25 km tile IDs in EPSG:5880 ----------------------------------------
-    gp   = gdf["geometry"].to_crs(CRS_METRIC)
+    # Reproject to output CRS (EPSG:5880) after repair is complete.
+    gdf = gdf.to_crs(CRS_METRIC)
+
+    # ------------------------------------------------------------------
+    # 6. 25 km tile IDs (EPSG:5880)
+    # Geometries are already in CRS_METRIC — no additional projection.
+    # ------------------------------------------------------------------
+    gp   = gdf["geometry"]  # already in CRS_METRIC
     rp   = gp.representative_point()
     tcol = np.floor(rp.x / tile_size_m).astype(np.int32)
     trow = np.floor(rp.y / tile_size_m).astype(np.int32)
@@ -132,20 +214,34 @@ def convert_to_geoparquet(
     gdf["tile_row"] = trow.values
     gdf["tile_id"]  = (tcol.astype(str) + "_" + trow.astype(str)).astype("category")
 
-    # -- Hilbert sort -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 7. Hilbert sort (spatial locality for DuckDB row-group pruning)
+    # ------------------------------------------------------------------
     gdf["_h"] = _hilbert(gp, gp.total_bounds, hilbert_p)
     del gp, rp, tcol, trow
-    gdf = gdf.sort_values("_h").drop(columns=["_h"]).reset_index(drop=True)
+    gdf = (
+        gdf.sort_values("_h")
+           .drop(columns=["_h"])
+           .reset_index(drop=True)
+    )
     gdf["tile_col"] = gdf["tile_col"].astype(np.int32)
     gdf["tile_row"] = gdf["tile_row"].astype(np.int32)
 
-    # -- write GeoParquet ---------------------------------------------------
+    # ------------------------------------------------------------------
+    # 8. Write GeoParquet
     # compression_level is forwarded via **kwargs to pq.write_table;
-    # no pyarrow rewrite needed (that would risk corrupting geo metadata).
+    # no pyarrow rewrite needed (a rewrite here would risk corrupting
+    # the 'geo' metadata in some pyarrow version combinations).
+    # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    _kw = dict(engine="pyarrow", compression=compression,
-               compression_level=compression_level,
-               index=False, row_group_size=row_group_size)
+
+    _kw = dict(
+        engine="pyarrow",
+        compression=compression,
+        compression_level=compression_level,
+        index=False,
+        row_group_size=row_group_size,
+    )
     try:
         gdf.to_parquet(output_path, write_covering_bbox=True,
                        schema_version="1.1.0", **_kw)
@@ -155,37 +251,167 @@ def convert_to_geoparquet(
         except TypeError:
             gdf.to_parquet(output_path, **_kw)
 
-    # -- report -------------------------------------------------------------
-    b    = gdf.total_bounds
-    size = os.path.getsize(output_path) / 1_048_576
-    report = dict(
-        input_path=input_path, output_path=output_path,
-        input_crs=in_crs, output_crs=CRS_GEO,
-        geometry_family=family,
-        n_features_in=n_in, n_features_out=n_out, n_dropped=n_in-n_out,
-        tile_size_km=tile_size_m/1_000, n_tiles=int(gdf["tile_id"].nunique()),
-        hilbert_p=hilbert_p, row_group_size=row_group_size,
-        compression=f"{compression}:{compression_level}",
-        bbox=dict(xmin=float(b[0]),ymin=float(b[1]),xmax=float(b[2]),ymax=float(b[3])),
-        file_size_mb=round(size, 3),
+    # ------------------------------------------------------------------
+    # 9. Patch CRS in 'geo' metadata (QGIS compatibility)
+    #
+    # convert_to_geoparquet always outputs EPSG:5880 (SIRGAS 2000 /
+    # Brazil Polyconic, metres) — the projected CRS mandated by IBGE
+    # for area calculation in Brazil.  Some geopandas/pyarrow version
+    # combinations write the 'crs' field as null inside the GeoParquet
+    # 'geo' metadata JSON, causing GIS clients to display "Unknown CRS".
+    # Since the output CRS is a known constant, we patch it unconditionally.
+    # ------------------------------------------------------------------
+    _patch_crs_metadata(
+        path=output_path,
+        compression=compression,
+        compression_level=compression_level,
+        row_group_size=row_group_size,
     )
+
+    # ------------------------------------------------------------------
+    # 10. Report
+    # ------------------------------------------------------------------
+    bounds = gdf.total_bounds
+    report = dict(
+        input_path=input_path,
+        output_path=output_path,
+        input_crs=in_crs,
+        output_crs=CRS_METRIC,
+        geometry_family=family,
+        n_features_in=n_in,
+        n_features_out=n_out,
+        n_dropped=n_in - n_out,
+        tile_size_km=tile_size_m / 1_000,
+        n_tiles=int(gdf["tile_id"].nunique()),
+        hilbert_p=hilbert_p,
+        row_group_size=row_group_size,
+        compression=f"{compression}:{compression_level}",
+        bbox=dict(
+            xmin=float(bounds[0]), ymin=float(bounds[1]),
+            xmax=float(bounds[2]), ymax=float(bounds[3]),
+        ),
+        file_size_mb=round(os.path.getsize(output_path) / 1_048_576, 3),
+    )
+
     sep = "-" * 62
-    print(f"\n{sep}\n  vector_to_geoparquet -- conversion complete\n{sep}")
-    for k, v in report.items(): print(f"  {k:<22}: {v}")
+    print(f"\n{sep}\n  vector_to_geoparquet v{__version__} — conversion complete\n{sep}")
+    for k, v in report.items():
+        print(f"  {k:<22}: {v}")
     print(sep)
     return report
 
 
 # ---------------------------------------------------------------------------
+# CRS metadata patch
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Output CRS constant
+# ---------------------------------------------------------------------------
+
+# IBGE Resolution R.PR-1/2005 mandates SIRGAS 2000 as the geodetic datum
+# for all Brazilian geographic data.  The projected form — EPSG:5880
+# (SIRGAS 2000 / Brazil Polyconic, unit: metres) — is the mandatory CRS
+# for area calculation.  convert_to_geoparquet always outputs EPSG:5880.
+_OUTPUT_CRS_ENTRY: dict = {
+    "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+    "type":    "ProjectedCRS",
+    "name":    "SIRGAS 2000 / Brazil Polyconic",
+    "id":      {"authority": "EPSG", "code": 5880},
+}
+
+
+def _patch_crs_metadata(
+    path: str,
+    compression:       str = "zstd",
+    compression_level: int = 3,
+    row_group_size:    int = 65_536,
+) -> None:
+    """Patch the ``geo`` metadata of a GeoParquet file to embed EPSG:4674.
+
+    ``convert_to_geoparquet`` always reprojects its output to EPSG:5880
+    (SIRGAS 2000 / Brazil Polyconic, metres), the projected CRS mandated
+    by IBGE Resolution R.PR-1/2005 for area calculation in Brazil.  Some combinations of
+    geopandas and pyarrow write the ``crs`` field as ``null`` inside the
+    GeoParquet ``geo`` metadata JSON, causing GIS clients (notably QGIS)
+    to display *Unknown CRS*.
+
+    Because the output CRS is a known invariant of this module, this
+    function patches it unconditionally using the authoritative EPSG:4674
+    authority/code reference — the most portable representation across
+    GIS clients.
+
+    The full table rewrite is **skipped** if the CRS field is already
+    populated, so there is no performance cost for well-formed files.
+
+    Parameters
+    ----------
+    path : str
+        Absolute or relative path to the ``.parquet`` file to patch.
+    compression : str
+        Parquet compression codec to use when rewriting.
+    compression_level : int
+        Compression level to use when rewriting.
+    row_group_size : int
+        Row-group size to preserve when rewriting.
+    """
+    import json
+    import pyarrow.parquet as pq
+
+    pf   = pq.ParquetFile(path)
+    meta = dict(pf.schema_arrow.metadata or {})
+
+    if b"geo" not in meta:
+        return
+
+    geo = json.loads(meta[b"geo"])
+    needs_patch = any(
+        col.get("crs") is None
+        for col in geo.get("columns", {}).values()
+    )
+    if not needs_patch:
+        return  # CRS already present — nothing to do.
+
+    for col in geo.get("columns", {}).values():
+        if col.get("crs") is None:
+            col["crs"] = _OUTPUT_CRS_ENTRY
+
+    meta[b"geo"] = json.dumps(geo, separators=(",", ":")).encode()
+
+    table = pq.read_table(path)
+    pq.write_table(
+        table.replace_schema_metadata(meta),
+        path,
+        compression=compression,
+        compression_level=compression_level,
+        row_group_size=row_group_size,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def _cli():
+
+def _cli() -> None:
+    """Entry point for the ``vector-to-geoparquet`` console script."""
     import sys
+
     if len(sys.argv) < 3:
-        print("Usage: vector-to-geoparquet <input> <output.parquet> [layer]")
+        print(
+            "Usage: vector-to-geoparquet <input> <output.parquet> [layer]\n\n"
+            "Examples:\n"
+            "  vector-to-geoparquet municipalities.shp municipalities.parquet\n"
+            "  vector-to-geoparquet data.gpkg properties.parquet car_properties\n"
+            "  vector-to-geoparquet biomes.geojson biomes.parquet\n"
+        )
         sys.exit(1)
-    convert_to_geoparquet(sys.argv[1], sys.argv[2],
-                          layer=sys.argv[3] if len(sys.argv) > 3 else None)
+
+    convert_to_geoparquet(
+        input_path=sys.argv[1],
+        output_path=sys.argv[2],
+        layer=sys.argv[3] if len(sys.argv) > 3 else None,
+    )
+
 
 if __name__ == "__main__":
     _cli()
