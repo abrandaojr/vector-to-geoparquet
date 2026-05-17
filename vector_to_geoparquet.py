@@ -341,8 +341,9 @@ def _patch_crs_metadata(
     authority/code reference — the most portable representation across
     GIS clients.
 
-    The full table rewrite is **skipped** if the CRS field is already
-    populated, so there is no performance cost for well-formed files.
+    The full table rewrite is **skipped** if the CRS field already matches
+    ``_OUTPUT_CRS_ENTRY`` exactly, so there is no performance cost on
+    subsequent runs.
 
     Parameters
     ----------
@@ -365,16 +366,22 @@ def _patch_crs_metadata(
         return
 
     geo = json.loads(meta[b"geo"])
-    needs_patch = any(
-        col.get("crs") is None
-        for col in geo.get("columns", {}).values()
-    )
-    if not needs_patch:
-        return  # CRS already present — nothing to do.
 
+    # Always overwrite the CRS field with the canonical authority/code
+    # reference for EPSG:5880, regardless of what geopandas wrote.
+    # geopandas may write a full PROJJSON that QGIS cannot match against
+    # its internal CRS database, resulting in "Unknown CRS" even when the
+    # field is technically populated.  Replacing it with an explicit
+    # {"authority": "EPSG", "code": 5880} entry ensures every GeoParquet-
+    # aware client resolves the projection correctly.
+    patched = False
     for col in geo.get("columns", {}).values():
-        if col.get("crs") is None:
+        if col.get("crs") != _OUTPUT_CRS_ENTRY:
             col["crs"] = _OUTPUT_CRS_ENTRY
+            patched = True
+
+    if not patched:
+        return  # already correct — skip the rewrite.
 
     meta[b"geo"] = json.dumps(geo, separators=(",", ":")).encode()
 
