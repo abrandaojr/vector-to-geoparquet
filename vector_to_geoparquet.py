@@ -358,14 +358,12 @@ def _patch_crs_metadata(
     import pyarrow.parquet as pq
 
     # Full rewrite via geopandas to guarantee correct CRS encoding.
-    # We do NOT skip based on whether the crs field is already populated:
-    # geopandas may write a PROJJSON that GDAL 3.12 cannot parse, resulting
-    # in "Unknown CRS" even though the field is technically non-null.
-    # Rewriting unconditionally via geopandas + set_crs is the only way to
-    # guarantee that the output is readable by all GeoParquet-aware clients.
+    # No skip condition: geopandas may write a PROJJSON that it can read
+    # back correctly (gdf.crs.to_epsg() == 5880) but that GDAL/OGR cannot
+    # parse, causing QGIS to display "Unknown CRS".  Always rewriting
+    # ensures the output is produced by geopandas with set_crs("EPSG:5880"),
+    # which generates a PROJJSON GDAL 3.12+ reliably recognises.
     gdf = gpd.read_parquet(path)
-    if gdf.crs is not None and gdf.crs.to_epsg() == 5880:
-        return  # already correct and readable — skip.
     gdf = gdf.set_crs("EPSG:5880", allow_override=True)
 
     _kw = dict(
