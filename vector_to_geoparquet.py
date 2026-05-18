@@ -341,72 +341,48 @@ def _patch_crs_metadata(
     compression_level: int = 3,
     row_group_size:    int = 65_536,
 ) -> None:
-    """Patch the ``geo`` metadata of a GeoParquet file to embed EPSG:4674.
+    """Patch CRS metadata of a GeoParquet file to embed the full EPSG:5880 PROJJSON.
 
-    ``convert_to_geoparquet`` always reprojects its output to EPSG:5880
-    (SIRGAS 2000 / Brazil Polyconic, metres), the projected CRS mandated
-    by IBGE Resolution R.PR-1/2005 for area calculation in Brazil.  Some combinations of
-    geopandas and pyarrow write the ``crs`` field as ``null`` inside the
-    GeoParquet ``geo`` metadata JSON, causing GIS clients (notably QGIS)
-    to display *Unknown CRS*.
+    This function re-reads the file as a GeoDataFrame and rewrites it with
+    the CRS explicitly set to EPSG:5880, using ``geopandas.to_parquet`` to
+    preserve the GeoParquet column encoding required by GDAL/OGR clients
+    such as QGIS.  A raw ``pyarrow.parquet.write_table`` rewrite loses the
+    WKB column encoding metadata and produces a file QGIS cannot recognise
+    as GeoParquet.
 
-    Because the output CRS is a known invariant of this module, this
-    function patches it unconditionally using the authoritative EPSG:4674
-    authority/code reference — the most portable representation across
-    GIS clients.
-
-    The full table rewrite is **skipped** if the CRS field already matches
-    ``_OUTPUT_CRS_ENTRY`` exactly, so there is no performance cost on
-    subsequent runs.
-
-    Parameters
-    ----------
-    path : str
-        Absolute or relative path to the ``.parquet`` file to patch.
-    compression : str
-        Parquet compression codec to use when rewriting.
-    compression_level : int
-        Compression level to use when rewriting.
-    row_group_size : int
-        Row-group size to preserve when rewriting.
+    The rewrite is **skipped** if the ``geo`` metadata already contains a
+    non-null ``crs`` field, so there is no cost on subsequent runs.
     """
     import json
+    import geopandas as gpd
     import pyarrow.parquet as pq
 
-    pf   = pq.ParquetFile(path)
-    meta = dict(pf.schema_arrow.metadata or {})
+    # Full rewrite via geopandas to guarantee correct CRS encoding.
+    # We do NOT skip based on whether the crs field is already populated:
+    # geopandas may write a PROJJSON that GDAL 3.12 cannot parse, resulting
+    # in "Unknown CRS" even though the field is technically non-null.
+    # Rewriting unconditionally via geopandas + set_crs is the only way to
+    # guarantee that the output is readable by all GeoParquet-aware clients.
+    gdf = gpd.read_parquet(path)
+    if gdf.crs is not None and gdf.crs.to_epsg() == 5880:
+        return  # already correct and readable — skip.
+    gdf = gdf.set_crs("EPSG:5880", allow_override=True)
 
-    if b"geo" not in meta:
-        return
-
-    geo = json.loads(meta[b"geo"])
-
-    # Always overwrite the CRS field with the canonical authority/code
-    # reference for EPSG:5880, regardless of what geopandas wrote.
-    # geopandas may write a full PROJJSON that QGIS cannot match against
-    # its internal CRS database, resulting in "Unknown CRS" even when the
-    # field is technically populated.  Replacing it with an explicit
-    # {"authority": "EPSG", "code": 5880} entry ensures every GeoParquet-
-    # aware client resolves the projection correctly.
-    patched = False
-    for col in geo.get("columns", {}).values():
-        if col.get("crs") != _OUTPUT_CRS_ENTRY:
-            col["crs"] = _OUTPUT_CRS_ENTRY
-            patched = True
-
-    if not patched:
-        return  # already correct — skip the rewrite.
-
-    meta[b"geo"] = json.dumps(geo, separators=(",", ":")).encode()
-
-    table = pq.read_table(path)
-    pq.write_table(
-        table.replace_schema_metadata(meta),
-        path,
+    _kw = dict(
+        engine="pyarrow",
         compression=compression,
         compression_level=compression_level,
+        index=False,
         row_group_size=row_group_size,
     )
+    try:
+        gdf.to_parquet(path, write_covering_bbox=True,
+                       schema_version="1.1.0", **_kw)
+    except TypeError:
+        try:
+            gdf.to_parquet(path, schema_version="1.1.0", **_kw)
+        except TypeError:
+            gdf.to_parquet(path, **_kw)
 
 
 # ---------------------------------------------------------------------------
