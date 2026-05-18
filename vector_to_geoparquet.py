@@ -313,12 +313,26 @@ def convert_to_geoparquet(
 # for all Brazilian geographic data.  The projected form — EPSG:5880
 # (SIRGAS 2000 / Brazil Polyconic, unit: metres) — is the mandatory CRS
 # for area calculation.  convert_to_geoparquet always outputs EPSG:5880.
-_OUTPUT_CRS_ENTRY: dict = {
-    "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
-    "type":    "ProjectedCRS",
-    "name":    "SIRGAS 2000 / Brazil Polyconic",
-    "id":      {"authority": "EPSG", "code": 5880},
-}
+#
+# The full PROJJSON is generated at import time via pyproj so that QGIS
+# and other OGR-based clients can match it against their internal CRS
+# database.  A minimal {"id": {"authority": "EPSG", "code": 5880}} entry
+# is insufficient — OGR requires the complete projection parameters.
+def _build_crs_entry() -> dict:
+    import json
+    try:
+        from pyproj import CRS
+        return json.loads(CRS("EPSG:5880").to_json())
+    except Exception:
+        # Fallback: minimal authority/code reference
+        return {
+            "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
+            "type":    "ProjectedCRS",
+            "name":    "SIRGAS 2000 / Brazil Polyconic",
+            "id":      {"authority": "EPSG", "code": 5880},
+        }
+
+_OUTPUT_CRS_ENTRY: dict = _build_crs_entry()
 
 
 def _patch_crs_metadata(
