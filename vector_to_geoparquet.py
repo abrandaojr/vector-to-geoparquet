@@ -357,22 +357,28 @@ def _patch_crs_metadata(
     import geopandas as gpd
     import pyarrow.parquet as pq
 
-    # Full rewrite via geopandas to guarantee correct CRS encoding.
-    # No skip condition: geopandas may write a PROJJSON that it can read
-    # back correctly (gdf.crs.to_epsg() == 5880) but that GDAL/OGR cannot
-    # parse, causing QGIS to display "Unknown CRS".  Always rewriting
-    # ensures the output is produced by geopandas with set_crs("EPSG:5880"),
-    # which generates a PROJJSON GDAL 3.12+ reliably recognises.
+    # GDAL cannot parse PROJJSON for EPSG:5880 reliably -- it shows
+    # "Layer SRS WKT: (unknown)" even with a complete PROJJSON.  WKT2
+    # is parsed correctly by GDAL in all versions.  This function:
+    #   1. Reads the file with geopandas
+    #   2. Writes it back with the CRS set to EPSG:5880
+    #   3. Then patches both the 'geo' metadata JSON and the Arrow
+    #      extension metadata on the geometry column to use WKT2 instead
+    #      of PROJJSON, which GDAL/OGR reads reliably.
+    import json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from pyproj import CRS
+
+    crs_obj = CRS("EPSG:5880")
+    wkt2     = crs_obj.to_wkt()          # WKT2:2019 — GDAL parses this reliably
+
+    # Step 1: read + rewrite via geopandas to set CRS correctly
     gdf = gpd.read_parquet(path)
     gdf = gdf.set_crs("EPSG:5880", allow_override=True)
-
-    _kw = dict(
-        engine="pyarrow",
-        compression=compression,
-        compression_level=compression_level,
-        index=False,
-        row_group_size=row_group_size,
-    )
+    _kw = dict(engine="pyarrow", compression=compression,
+               compression_level=compression_level,
+               index=False, row_group_size=row_group_size)
     try:
         gdf.to_parquet(path, write_covering_bbox=True,
                        schema_version="1.1.0", **_kw)
@@ -381,6 +387,40 @@ def _patch_crs_metadata(
             gdf.to_parquet(path, schema_version="1.1.0", **_kw)
         except TypeError:
             gdf.to_parquet(path, **_kw)
+
+    # Step 2: patch 'geo' metadata to use WKT2 string instead of PROJJSON.
+    # GDAL's Parquet driver reads the CRS from the 'geo' metadata blob and
+    # also from the Arrow extension metadata on the geometry column.
+    # WKT2 is far more reliably parsed than PROJJSON in GDAL 3.x.
+    table = pq.read_table(path)
+    schema_meta = dict(table.schema.metadata or {})
+
+    # Patch top-level 'geo' metadata
+    if b"geo" in schema_meta:
+        geo = json.loads(schema_meta[b"geo"])
+        for col in geo.get("columns", {}).values():
+            col["crs"] = wkt2          # WKT2 string, not PROJJSON dict
+        schema_meta[b"geo"] = json.dumps(geo, separators=(",", ":")).encode()
+
+    # Patch Arrow extension metadata on the geometry column
+    ext_meta_new = json.dumps({"crs": wkt2}, separators=(",", ":")).encode()
+    new_fields = []
+    for field in table.schema:
+        fm = dict(field.metadata or {})
+        if (b"ARROW:extension:name" in fm
+                and fm[b"ARROW:extension:name"] == b"geoarrow.wkb"):
+            fm[b"ARROW:extension:metadata"] = ext_meta_new
+            field = field.with_metadata(fm)
+        new_fields.append(field)
+
+    new_schema = pa.schema(new_fields, metadata=schema_meta)
+    pq.write_table(
+        pa.Table.from_arrays(table.columns, schema=new_schema),
+        path,
+        compression=compression,
+        compression_level=compression_level,
+        row_group_size=row_group_size,
+    )
 
 
 # ---------------------------------------------------------------------------
