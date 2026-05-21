@@ -15,7 +15,7 @@ Input norm : SIRGAS 2000 geographic -- EPSG:4674  (intermediate step only)
 
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 def convert_to_geoparquet(
@@ -59,14 +59,11 @@ def convert_to_geoparquet(
     # ------------------------------------------------------------------
     # Imports
     # ------------------------------------------------------------------
-    import json
     import os
     import warnings
 
     import numpy as np
     import geopandas as gpd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
     from shapely import make_valid
     from shapely.geometry import (
         LineString, MultiLineString,
@@ -159,7 +156,6 @@ def convert_to_geoparquet(
     # Geometry repair (make_valid) is applied in geographic space
     # (EPSG:4674) before the final reproject to the output CRS
     # (EPSG:5880 — SIRGAS 2000 / Brazil Polyconic, unit: metres).
-    # EPSG:4674 is used only as an intermediate normalisation step.
     # ------------------------------------------------------------------
     if gdf.crs is None:
         warnings.warn("No CRS defined — assuming EPSG:4674.", UserWarning, stacklevel=2)
@@ -206,7 +202,7 @@ def convert_to_geoparquet(
     # 6. 25 km tile IDs (EPSG:5880)
     # Geometries are already in CRS_METRIC — no additional projection.
     # ------------------------------------------------------------------
-    gp   = gdf["geometry"]  # already in CRS_METRIC
+    gp   = gdf["geometry"]
     rp   = gp.representative_point()
     tcol = np.floor(rp.x / tile_size_m).astype(np.int32)
     trow = np.floor(rp.y / tile_size_m).astype(np.int32)
@@ -229,9 +225,6 @@ def convert_to_geoparquet(
 
     # ------------------------------------------------------------------
     # 8. Write GeoParquet
-    # compression_level is forwarded via **kwargs to pq.write_table;
-    # no pyarrow rewrite needed (a rewrite here would risk corrupting
-    # the 'geo' metadata in some pyarrow version combinations).
     # ------------------------------------------------------------------
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -252,24 +245,7 @@ def convert_to_geoparquet(
             gdf.to_parquet(output_path, **_kw)
 
     # ------------------------------------------------------------------
-    # 9. Patch CRS in 'geo' metadata (QGIS compatibility)
-    #
-    # convert_to_geoparquet always outputs EPSG:5880 (SIRGAS 2000 /
-    # Brazil Polyconic, metres) — the projected CRS mandated by IBGE
-    # for area calculation in Brazil.  Some geopandas/pyarrow version
-    # combinations write the 'crs' field as null inside the GeoParquet
-    # 'geo' metadata JSON, causing GIS clients to display "Unknown CRS".
-    # Since the output CRS is a known constant, we patch it unconditionally.
-    # ------------------------------------------------------------------
-    _patch_crs_metadata(
-        path=output_path,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_size=row_group_size,
-    )
-
-    # ------------------------------------------------------------------
-    # 10. Report
+    # 9. Report
     # ------------------------------------------------------------------
     bounds = gdf.total_bounds
     report = dict(
@@ -299,128 +275,6 @@ def convert_to_geoparquet(
         print(f"  {k:<22}: {v}")
     print(sep)
     return report
-
-
-# ---------------------------------------------------------------------------
-# CRS metadata patch
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Output CRS constant
-# ---------------------------------------------------------------------------
-
-# IBGE Resolution R.PR-1/2005 mandates SIRGAS 2000 as the geodetic datum
-# for all Brazilian geographic data.  The projected form — EPSG:5880
-# (SIRGAS 2000 / Brazil Polyconic, unit: metres) — is the mandatory CRS
-# for area calculation.  convert_to_geoparquet always outputs EPSG:5880.
-#
-# The full PROJJSON is generated at import time via pyproj so that QGIS
-# and other OGR-based clients can match it against their internal CRS
-# database.  A minimal {"id": {"authority": "EPSG", "code": 5880}} entry
-# is insufficient — OGR requires the complete projection parameters.
-def _build_crs_entry() -> dict:
-    import json
-    try:
-        from pyproj import CRS
-        return json.loads(CRS("EPSG:5880").to_json())
-    except Exception:
-        # Fallback: minimal authority/code reference
-        return {
-            "$schema": "https://proj.org/schemas/v0.7/projjson.schema.json",
-            "type":    "ProjectedCRS",
-            "name":    "SIRGAS 2000 / Brazil Polyconic",
-            "id":      {"authority": "EPSG", "code": 5880},
-        }
-
-_OUTPUT_CRS_ENTRY: dict = _build_crs_entry()
-
-
-def _patch_crs_metadata(
-    path: str,
-    compression:       str = "zstd",
-    compression_level: int = 3,
-    row_group_size:    int = 65_536,
-) -> None:
-    """Patch CRS metadata of a GeoParquet file to embed the full EPSG:5880 PROJJSON.
-
-    This function re-reads the file as a GeoDataFrame and rewrites it with
-    the CRS explicitly set to EPSG:5880, using ``geopandas.to_parquet`` to
-    preserve the GeoParquet column encoding required by GDAL/OGR clients
-    such as QGIS.  A raw ``pyarrow.parquet.write_table`` rewrite loses the
-    WKB column encoding metadata and produces a file QGIS cannot recognise
-    as GeoParquet.
-
-    The rewrite is **skipped** if the ``geo`` metadata already contains a
-    non-null ``crs`` field, so there is no cost on subsequent runs.
-    """
-    import json
-    import geopandas as gpd
-    import pyarrow.parquet as pq
-
-    # GDAL cannot parse PROJJSON for EPSG:5880 reliably -- it shows
-    # "Layer SRS WKT: (unknown)" even with a complete PROJJSON.  WKT2
-    # is parsed correctly by GDAL in all versions.  This function:
-    #   1. Reads the file with geopandas
-    #   2. Writes it back with the CRS set to EPSG:5880
-    #   3. Then patches both the 'geo' metadata JSON and the Arrow
-    #      extension metadata on the geometry column to use WKT2 instead
-    #      of PROJJSON, which GDAL/OGR reads reliably.
-    import json
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-    from pyproj import CRS
-
-    crs_obj = CRS("EPSG:5880")
-    wkt2     = crs_obj.to_wkt()          # WKT2:2019 — GDAL parses this reliably
-
-    # Step 1: read + rewrite via geopandas to set CRS correctly
-    gdf = gpd.read_parquet(path)
-    gdf = gdf.set_crs("EPSG:5880", allow_override=True)
-    _kw = dict(engine="pyarrow", compression=compression,
-               compression_level=compression_level,
-               index=False, row_group_size=row_group_size)
-    try:
-        gdf.to_parquet(path, write_covering_bbox=True,
-                       schema_version="1.1.0", **_kw)
-    except TypeError:
-        try:
-            gdf.to_parquet(path, schema_version="1.1.0", **_kw)
-        except TypeError:
-            gdf.to_parquet(path, **_kw)
-
-    # Step 2: patch 'geo' metadata to use WKT2 string instead of PROJJSON.
-    # GDAL's Parquet driver reads the CRS from the 'geo' metadata blob and
-    # also from the Arrow extension metadata on the geometry column.
-    # WKT2 is far more reliably parsed than PROJJSON in GDAL 3.x.
-    table = pq.read_table(path)
-    schema_meta = dict(table.schema.metadata or {})
-
-    # Patch top-level 'geo' metadata
-    if b"geo" in schema_meta:
-        geo = json.loads(schema_meta[b"geo"])
-        for col in geo.get("columns", {}).values():
-            col["crs"] = wkt2          # WKT2 string, not PROJJSON dict
-        schema_meta[b"geo"] = json.dumps(geo, separators=(",", ":")).encode()
-
-    # Patch Arrow extension metadata on the geometry column
-    ext_meta_new = json.dumps({"crs": wkt2}, separators=(",", ":")).encode()
-    new_fields = []
-    for field in table.schema:
-        fm = dict(field.metadata or {})
-        if (b"ARROW:extension:name" in fm
-                and fm[b"ARROW:extension:name"] == b"geoarrow.wkb"):
-            fm[b"ARROW:extension:metadata"] = ext_meta_new
-            field = field.with_metadata(fm)
-        new_fields.append(field)
-
-    new_schema = pa.schema(new_fields, metadata=schema_meta)
-    pq.write_table(
-        pa.Table.from_arrays(table.columns, schema=new_schema),
-        path,
-        compression=compression,
-        compression_level=compression_level,
-        row_group_size=row_group_size,
-    )
 
 
 # ---------------------------------------------------------------------------
