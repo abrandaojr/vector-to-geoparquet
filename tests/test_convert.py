@@ -2,122 +2,91 @@
 Tests for vector_to_geoparquet.convert_to_geoparquet().
 """
 
+from __future__ import annotations
+
 import os
-import tempfile
 
 import geopandas as gpd
 import numpy as np
 import pytest
-from shapely.geometry import Point, Polygon, LineString, GeometryCollection
+from shapely.geometry import GeometryCollection, Polygon
 
 from vector_to_geoparquet import convert_to_geoparquet
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _brazil_polygon():
-    """Simple polygon well inside Brazilian territory (Mato Grosso area)."""
-    return Polygon([
-        (-55.0, -12.0),
-        (-54.0, -12.0),
-        (-54.0, -11.0),
-        (-55.0, -11.0),
-        (-55.0, -12.0),
-    ])
-
-
-def _make_gpkg(path: str, geoms, crs="EPSG:4674"):
-    gdf = gpd.GeoDataFrame(
-        {"attr": list(range(len(geoms)))},
-        geometry=geoms,
-        crs=crs,
-    )
-    gdf.to_file(path, driver="GPKG")
-    return gdf
 
 
 # ---------------------------------------------------------------------------
 # CRS
 # ---------------------------------------------------------------------------
 
+
 class TestOutputCRS:
-    def test_output_crs_is_epsg4674(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_output_crs_is_epsg5880(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 5)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         assert result.crs is not None
-        assert result.crs.to_epsg() == 4674, (
-            f"Expected EPSG:4674 but got {result.crs.to_epsg()}"
+        assert result.crs.to_epsg() == 5880, (
+            f"Expected EPSG:5880 but got {result.crs.to_epsg()}"
         )
 
-    def test_input_reprojected_from_sad69(self, tmp_path):
-        """Input in SAD 69 (EPSG:4618) must be accepted and output in EPSG:4674."""
-        src = str(tmp_path / "input_sad69.gpkg")
+    def test_input_reprojected_from_sad69(self, tmp_path, make_gpkg, brazil_polygon):
+        src = str(tmp_path / "sad69.gpkg")
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3, crs="EPSG:4618")
+        make_gpkg(src, [brazil_polygon(i * 0.05) for i in range(3)], crs="EPSG:4618")
         convert_to_geoparquet(src, out)
         result = gpd.read_parquet(out)
-        assert result.crs.to_epsg() == 4674
+        assert result.crs.to_epsg() == 5880
 
-    def test_report_output_crs(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_report_output_crs(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        report = convert_to_geoparquet(src, out)
-        assert report["output_crs"] == "EPSG:4674"
+        report = convert_to_geoparquet(polygon_gpkg, out)
+        assert report["output_crs"] == "EPSG:5880"
 
-    def test_geometry_coordinates_are_degrees(self, tmp_path):
-        """Geometry stored in geographic CRS must have longitude in [-180, 180]."""
-        src = str(tmp_path / "input.gpkg")
+    def test_geometry_coordinates_are_metres(self, polygon_gpkg, tmp_path):
+        """Geometry in EPSG:5880 must have x values in the metre range for Brazil."""
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
-        bounds = result.total_bounds  # xmin, ymin, xmax, ymax
-        assert -180 <= bounds[0] <= 180, "xmin out of degree range -- geometry may be in metres"
-        assert -90 <= bounds[1] <= 90, "ymin out of degree range -- geometry may be in metres"
+        bounds = result.total_bounds
+        # EPSG:5880 x values for Brazil are in the range ~-3e6 to +3e6 metres
+        assert abs(bounds[0]) > 1_000, (
+            "xmin looks like degrees -- geometry may not be in EPSG:5880"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Geometry type homogeneity
 # ---------------------------------------------------------------------------
 
+
 class TestGeometryHomogeneity:
-    def test_polygon_only_output(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_polygon_only_output(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 4)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         assert all(t in ("Polygon", "MultiPolygon") for t in result.geom_type)
 
-    def test_line_only_output(self, tmp_path):
+    def test_line_only_output(self, tmp_path, make_gpkg, brazil_line):
         src = str(tmp_path / "lines.gpkg")
         out = str(tmp_path / "out.parquet")
-        lines = [LineString([(-55 + i * 0.1, -12), (-54 + i * 0.1, -11)]) for i in range(4)]
-        _make_gpkg(src, lines)
+        make_gpkg(src, [brazil_line(i * 0.1) for i in range(4)])
         convert_to_geoparquet(src, out)
         result = gpd.read_parquet(out)
         assert all(t in ("LineString", "MultiLineString") for t in result.geom_type)
 
-    def test_point_only_output(self, tmp_path):
+    def test_point_only_output(self, tmp_path, make_gpkg, brazil_point):
         src = str(tmp_path / "points.gpkg")
         out = str(tmp_path / "out.parquet")
-        points = [Point(-55 + i * 0.1, -12 + i * 0.1) for i in range(5)]
-        _make_gpkg(src, points)
+        make_gpkg(src, [brazil_point(i * 0.1) for i in range(5)])
         convert_to_geoparquet(src, out)
         result = gpd.read_parquet(out)
         assert all(t in ("Point", "MultiPoint") for t in result.geom_type)
 
-    def test_geometry_collection_decomposed(self, tmp_path):
+    def test_geometry_collection_decomposed(self, tmp_path, make_gpkg, brazil_polygon):
         src = str(tmp_path / "gc.gpkg")
         out = str(tmp_path / "out.parquet")
-        gc = GeometryCollection([_brazil_polygon(), _brazil_polygon()])
-        _make_gpkg(src, [gc, _brazil_polygon()])
+        gc = GeometryCollection([brazil_polygon(), brazil_polygon(0.01)])
+        make_gpkg(src, [gc, brazil_polygon(0.1)])
         convert_to_geoparquet(src, out)
         result = gpd.read_parquet(out)
         assert all(t in ("Polygon", "MultiPolygon") for t in result.geom_type)
@@ -127,16 +96,14 @@ class TestGeometryHomogeneity:
 # Geometry repair
 # ---------------------------------------------------------------------------
 
+
 class TestGeometryRepair:
-    def test_self_intersecting_polygon_repaired(self, tmp_path):
-        """Bowtie polygon is invalid; make_valid should repair it."""
-        from shapely.geometry import Polygon as _Poly
-        bowtie = _Poly([(0, 0), (1, 1), (1, 0), (0, 1), (0, 0)])
+    def test_self_intersecting_polygon_repaired(self, tmp_path, make_gpkg, brazil_polygon):
+        bowtie = Polygon([(0, 0), (1, 1), (1, 0), (0, 1), (0, 0)])
         src = str(tmp_path / "bowtie.gpkg")
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [bowtie, _brazil_polygon()])
-        # Should not raise
-        report = convert_to_geoparquet(src, out)
+        make_gpkg(src, [bowtie, brazil_polygon()])
+        convert_to_geoparquet(src, out)
         result = gpd.read_parquet(out)
         assert result.geometry.is_valid.all()
 
@@ -145,22 +112,17 @@ class TestGeometryRepair:
 # Tile columns
 # ---------------------------------------------------------------------------
 
-class TestTileColumns:
-    def test_tile_columns_present(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
-        out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 5)
-        convert_to_geoparquet(src, out)
-        result = gpd.read_parquet(out)
-        assert "tile_col" in result.columns
-        assert "tile_row" in result.columns
-        assert "tile_id" in result.columns
 
-    def test_tile_id_format(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+class TestTileColumns:
+    def test_tile_columns_present(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 5)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
+        result = gpd.read_parquet(out)
+        assert {"tile_col", "tile_row", "tile_id"}.issubset(result.columns)
+
+    def test_tile_id_format(self, polygon_gpkg, tmp_path):
+        out = str(tmp_path / "out.parquet")
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         for tid in result["tile_id"]:
             parts = str(tid).split("_")
@@ -168,11 +130,9 @@ class TestTileColumns:
             assert parts[0].lstrip("-").isdigit()
             assert parts[1].lstrip("-").isdigit()
 
-    def test_tile_col_row_dtype(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_tile_col_row_dtype(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 5)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         assert result["tile_col"].dtype == np.int32
         assert result["tile_row"].dtype == np.int32
@@ -182,39 +142,25 @@ class TestTileColumns:
 # Parquet schema
 # ---------------------------------------------------------------------------
 
+
 class TestParquetSchema:
-    def test_geometry_column_present(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_geometry_column_present(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         assert "geometry" in result.columns
 
-    def test_bbox_column_present(self, tmp_path):
-        """GeoParquet 1.1 covering bbox struct must be present if supported."""
-        src = str(tmp_path / "input.gpkg")
+    def test_original_attributes_preserved(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        convert_to_geoparquet(src, out)
-        import pyarrow.parquet as pq
-        schema = pq.read_schema(out)
-        field_names = schema.names
-        # bbox may be written or not depending on GeoPandas version; just check no crash
-        assert "geometry" in field_names
-
-    def test_original_attributes_preserved(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
-        out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 4)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         result = gpd.read_parquet(out)
         assert "attr" in result.columns
 
 
 # ---------------------------------------------------------------------------
-# Report keys
+# Report
 # ---------------------------------------------------------------------------
+
 
 class TestReport:
     EXPECTED_KEYS = {
@@ -224,41 +170,33 @@ class TestReport:
         "compression", "bbox", "file_size_mb",
     }
 
-    def test_report_has_all_keys(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_report_has_all_keys(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 5)
-        report = convert_to_geoparquet(src, out)
+        report = convert_to_geoparquet(polygon_gpkg, out)
         assert self.EXPECTED_KEYS.issubset(report.keys())
 
-    def test_report_feature_counts(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_report_feature_counts(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        n = 7
-        _make_gpkg(src, [_brazil_polygon()] * n)
-        report = convert_to_geoparquet(src, out)
-        assert report["n_features_in"] == n
-        assert report["n_features_out"] <= n
+        report = convert_to_geoparquet(polygon_gpkg, out)
+        assert report["n_features_in"] == 5
+        assert report["n_features_out"] <= 5
         assert report["n_dropped"] == report["n_features_in"] - report["n_features_out"]
 
-    def test_report_bbox_keys(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_report_bbox_keys(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        report = convert_to_geoparquet(src, out)
+        report = convert_to_geoparquet(polygon_gpkg, out)
         assert set(report["bbox"].keys()) == {"xmin", "ymin", "xmax", "ymax"}
 
-    def test_report_file_size_positive(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_report_file_size_positive(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        report = convert_to_geoparquet(src, out)
+        report = convert_to_geoparquet(polygon_gpkg, out)
         assert report["file_size_mb"] > 0
 
 
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
+
 
 class TestErrorHandling:
     def test_empty_file_raises(self, tmp_path):
@@ -269,16 +207,12 @@ class TestErrorHandling:
         with pytest.raises(ValueError, match="no features"):
             convert_to_geoparquet(src, out)
 
-    def test_output_file_created(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_output_file_created(self, polygon_gpkg, tmp_path):
         out = str(tmp_path / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        convert_to_geoparquet(src, out)
+        convert_to_geoparquet(polygon_gpkg, out)
         assert os.path.exists(out)
 
-    def test_output_directory_created(self, tmp_path):
-        src = str(tmp_path / "input.gpkg")
+    def test_output_directory_created(self, polygon_gpkg, tmp_path):
         nested_out = str(tmp_path / "subdir" / "nested" / "out.parquet")
-        _make_gpkg(src, [_brazil_polygon()] * 3)
-        convert_to_geoparquet(src, nested_out)
+        convert_to_geoparquet(polygon_gpkg, nested_out)
         assert os.path.exists(nested_out)

@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "vector-to-geoparquet"
-version = "1.3.0"
+version = "1.4.0"
 description = "Brazil-specific converter from any vector format to DuckDB-optimized GeoParquet using SIRGAS2000 (IBGE R.PR-1/2005)"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -52,3 +52,6 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
 ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
