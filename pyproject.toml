@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vector-to-geoparquet"
-version = "1.4.0"
+version = "1.4.1"
 description = "Brazil-specific converter from any vector format to DuckDB-optimized GeoParquet using SIRGAS2000 (IBGE R.PR-1/2005)"
 readme = "README.md"
 license = { file = "LICENSE" }

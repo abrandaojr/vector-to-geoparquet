@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 # Intermediate CRS: all inputs are normalised here before reprojection.
 CRS_GEO = "EPSG:4674"  # SIRGAS 2000 geographic

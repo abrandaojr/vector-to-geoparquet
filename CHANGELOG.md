@@ -3,6 +3,19 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [1.4.1] - 2026-06-15
+
+### Fixed
+
+- PROJ database selection on mixed geospatial Python environments. The package
+  no longer forces pyproj's bundled `proj.db` when that database is older than
+  the PROJ layout required by GDAL/pyogrio/rasterio. This avoids warnings such
+  as `DATABASE.LAYOUT.VERSION.MINOR = 4 whereas a number >= 5 is expected`.
+- Added tests that verify a compatible `PROJ_DATA` / `PROJ_LIB` setting is not
+  downgraded to an incompatible pyproj database.
+
+---
+
 ## [1.4.0] - 2026-05-22
 
 ### Changed
